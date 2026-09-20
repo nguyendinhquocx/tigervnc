@@ -2,7 +2,7 @@
  * Copyright (C) 2006 Constantin Kaplinsky.  All Rights Reserved.
  * Copyright (C) 2009 Paul Donohue.  All Rights Reserved.
  * Copyright (C) 2010, 2012-2013 D. R. Commander.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -98,8 +98,13 @@ class Viewport extends JPanel implements ActionListener {
     addFocusListener(new FocusAdapter() {
       public void focusGained(FocusEvent e) {
         ClipboardDialog.clientCutText();
+        pendingSyntheticLock.clear();
+        // We may have gotten our lock keys out of sync with the server
+        // whilst we didn't have focus. Try to sort this out.
+        pushLEDState();
       }
       public void focusLost(FocusEvent e) {
+        pendingSyntheticLock.clear();
         releaseDownKeys();
       }
     });
@@ -176,8 +181,8 @@ class Viewport extends JPanel implements ActionListener {
       cursorHotspot.x = cursorHotspot.y = 3;
     } else {
       if ((width == 0) || (height == 0)) {
-        cursor = new BufferedImage(tk.getBestCursorSize(0, 0).width,
-                                   tk.getBestCursorSize(0, 0).height,
+        Dimension d = tk.getBestCursorSize(0, 0);
+        cursor = new BufferedImage(Math.max(d.width, 1), Math.max(d.height, 1),
                                    BufferedImage.TYPE_INT_ARGB_PRE);
         cursorHotspot.x = cursorHotspot.y = 0;
       } else {
@@ -195,7 +200,8 @@ class Viewport extends JPanel implements ActionListener {
     int x = cursorHotspot.x;
     int y = cursorHotspot.y;
     Dimension cs = tk.getBestCursorSize(cw, ch);
-    if (cs.width != cursor.getWidth() || cs.height != cursor.getHeight()) {
+    if (cs.width > 0 && cs.height > 0 &&
+        (cs.width != cursor.getWidth() || cs.height != cursor.getHeight())) {
       cw = VncViewer.os.startsWith("windows") ?  Math.min(cw, cs.width) : cs.width;
       ch = VncViewer.os.startsWith("windows") ?  Math.min(ch, cs.height) : cs.height;
       BufferedImage tmp = new BufferedImage(cs.width, cs.height, BufferedImage.TYPE_INT_ARGB_PRE);
@@ -378,6 +384,10 @@ class Viewport extends JPanel implements ActionListener {
     }
   }
 
+  // Synthetic key code for fake events; cannot collide with real
+  // (vk | location<<32) values.
+  private static final long FAKE_KEY_CODE = -1L;
+
   public void handleKeyPress(long keyCode, int keySym)
   {
     // Prevent recursion if the menu wants to send it's own
@@ -447,11 +457,9 @@ class Viewport extends JPanel implements ActionListener {
     vlog.debug("Key pressed: 0x%016x => 0x%04x", keyCode, keySym);
 
     try {
-      // Fake keycode?
-      if (keyCode > 0xffffffffL)
-        cc.writer().writeKeyEvent(keySym, true);
-      else
-        cc.writer().writeKeyEvent(keySym, true);
+      int vkCode = (int)(keyCode & 0xffffffffL);
+      int keyLocation = (int)(keyCode >>> 32);
+      cc.writer().writeKeyEvent(keySym, QemuKeyMap.toQnum(vkCode, keyLocation), true);
     } catch (Exception e) {
       vlog.error("%s", e.getMessage());
       cc.close();
@@ -491,10 +499,9 @@ class Viewport extends JPanel implements ActionListener {
     vlog.debug("Key released: 0x%016x => 0x%04x", keyCode, iter);
 
     try {
-      if (keyCode > 0xffffffffL)
-        cc.writer().writeKeyEvent(iter, false);
-      else
-        cc.writer().writeKeyEvent(iter, false);
+      int vkCode = (int)(keyCode & 0xffffffffL);
+      int keyLocation = (int)(keyCode >>> 32);
+      cc.writer().writeKeyEvent(iter, QemuKeyMap.toQnum(vkCode, keyLocation), false);
     } catch (Exception e) {
       vlog.error("%s", e.getMessage());
       cc.close();
@@ -508,6 +515,23 @@ class Viewport extends JPanel implements ActionListener {
 
     if (event instanceof KeyEvent) {
       KeyEvent ev = (KeyEvent)event;
+
+      // Swallow lock-key events we injected ourselves via
+      // setLockingKeyState() so they don't bounce back to the server.
+      int rawVk = ev.getKeyCode();
+      if (rawVk == VK_CAPS_LOCK || rawVk == VK_NUM_LOCK ||
+          rawVk == VK_SCROLL_LOCK) {
+        Integer pending = pendingSyntheticLock.get(rawVk);
+        if (pending != null && pending > 0) {
+          if (ev.getID() == KeyEvent.KEY_RELEASED)
+            pendingSyntheticLock.put(rawVk, pending - 1);
+          vlog.debug("Ignoring self-injected lock key %s (vk 0x%x)",
+                     ev.getID() == KeyEvent.KEY_PRESSED ? "press" : "release",
+                     rawVk);
+          return 1;
+        }
+      }
+
       if (KeyMap.get_keycode_fallback_extended(ev) == 0) {
         // Not much we can do with this...
         vlog.debug("Ignoring KeyEvent with unknown Java keycode");
@@ -818,6 +842,95 @@ class Viewport extends JPanel implements ActionListener {
       handleKeyRelease(downKeySym.keySet().iterator().next());
   }
 
+  public void setLEDState(int ledState)
+  {
+    vlog.debug("Got server LED state: 0x%08x", ledState);
+
+    // The first message is just considered to be the server announcing
+    // support for this extension. We will push our state to sync up the
+    // server when we get focus. If we already have focus we need to push
+    // it here though.
+    if (firstLEDState) {
+      firstLEDState = false;
+      if (isFocusOwner())
+        pushLEDState();
+      return;
+    }
+
+    if (viewOnly.getValue())
+      return;
+
+    if (!isFocusOwner())
+      return;
+
+    Toolkit tk = getToolkit();
+    syncLocalLockKey(tk, VK_CAPS_LOCK, (ledState & LedStates.ledCapsLock) != 0);
+    syncLocalLockKey(tk, VK_NUM_LOCK, (ledState & LedStates.ledNumLock) != 0);
+    syncLocalLockKey(tk, VK_SCROLL_LOCK, (ledState & LedStates.ledScrollLock) != 0);
+  }
+
+  private void syncLocalLockKey(Toolkit tk, int vk, boolean on)
+  {
+    Boolean cur = getLockingKeyStateSafe(tk, vk);
+    if (cur != null && cur == on)
+      return;
+    try {
+      tk.setLockingKeyState(vk, on);
+    } catch (UnsupportedOperationException e) {
+      vlog.debug("Unable to set local keyboard LED state for key 0x%x: "+
+                "not supported on this platform", vk);
+      return;
+    }
+    Integer pending = pendingSyntheticLock.get(vk);
+    pendingSyntheticLock.put(vk, (pending == null ? 0 : pending) + 1);
+  }
+
+  private static Boolean getLockingKeyStateSafe(Toolkit tk, int vk)
+  {
+    try {
+      return tk.getLockingKeyState(vk);
+    } catch (UnsupportedOperationException e) {
+      return null;
+    }
+  }
+
+  private void pushLEDState()
+  {
+    if (viewOnly.getValue())
+      return;
+
+    // Does the server even support this extension?
+    if (cc.server.ledState() == LedStates.ledUnknown)
+      return;
+
+    Toolkit tk = getToolkit();
+    Boolean caps = getLockingKeyStateSafe(tk, VK_CAPS_LOCK);
+    Boolean num = getLockingKeyStateSafe(tk, VK_NUM_LOCK);
+    Boolean scroll = getLockingKeyStateSafe(tk, VK_SCROLL_LOCK);
+
+    // Any lock key this platform can't report on is left alone rather
+    // than assumed to be off, so we don't fight the server every time
+    // over a key we have no way to actually read or set.
+    if (caps != null &&
+        caps != ((cc.server.ledState() & LedStates.ledCapsLock) != 0)) {
+      vlog.debug("Inserting fake CapsLock to get in sync with server");
+      handleKeyPress(FAKE_KEY_CODE, XK_Caps_Lock);
+      handleKeyRelease(FAKE_KEY_CODE);
+    }
+    if (num != null &&
+        num != ((cc.server.ledState() & LedStates.ledNumLock) != 0)) {
+      vlog.debug("Inserting fake NumLock to get in sync with server");
+      handleKeyPress(FAKE_KEY_CODE, XK_Num_Lock);
+      handleKeyRelease(FAKE_KEY_CODE);
+    }
+    if (scroll != null &&
+        scroll != ((cc.server.ledState() & LedStates.ledScrollLock) != 0)) {
+      vlog.debug("Inserting fake ScrollLock to get in sync with server");
+      handleKeyPress(FAKE_KEY_CODE, XK_Scroll_Lock);
+      handleKeyRelease(FAKE_KEY_CODE);
+    }
+  }
+
   private DesktopWindow window() {
     return (DesktopWindow)getTopLevelAncestor();
   }
@@ -827,6 +940,12 @@ class Viewport extends JPanel implements ActionListener {
   private int h() { return getHeight(); }
   // access to cc by different threads is specified in CConn
   private CConn cc;
+
+  private boolean firstLEDState = true;
+
+  // Expected lock-key echoes from setLockingKeyState(), per VK.
+  private final HashMap<Integer, Integer> pendingSyntheticLock =
+    new HashMap<Integer, Integer>();
 
   // access to the following must be synchronized:
   private PlatformPixelBuffer frameBuffer;

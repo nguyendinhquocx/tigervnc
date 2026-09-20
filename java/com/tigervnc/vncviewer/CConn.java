@@ -1,7 +1,7 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
  * Copyright 2009-2013 Pierre Ossman <ossman@cendio.se> for Cendio AB
  * Copyright (C) 2011-2013 D. R. Commander.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -35,7 +35,6 @@
 package com.tigervnc.vncviewer;
 
 import java.awt.*;
-import java.awt.datatransfer.StringSelection;
 import java.awt.event.*;
 import java.awt.Toolkit;
 import java.nio.channels.SelectableChannel;
@@ -52,6 +51,8 @@ import javax.swing.ImageIcon;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.prefs.*;
 
 import com.tigervnc.rdr.*;
@@ -60,6 +61,9 @@ import com.tigervnc.rfb.Point;
 import com.tigervnc.rfb.Exception;
 import com.tigervnc.network.Socket;
 import com.tigervnc.network.TcpSocket;
+import com.tigervnc.network.UnixSocket;
+
+import com.jcraft.jsch.Session;
 
 import static com.tigervnc.vncviewer.Parameters.*;
 
@@ -93,6 +97,7 @@ public final class CConn extends CConnection implements
     server.supportsLocalCursor = true;
     server.supportsDesktopResize = true;
     server.supportsClientRedirect = true;
+    server.supportsLEDState = true;
 
     if (customCompressLevel.getValue())
       setCompressLevel(compressLevel.getValue());
@@ -109,6 +114,17 @@ public final class CConn extends CConnection implements
         setServerName(Hostname.getHost(vncServerName));
         setServerPort(Hostname.getPort(vncServerName));
       }
+      // A "host:/path" connection string only makes sense via an SSH
+      // tunnel (there's no local path to connect to otherwise), so treat
+      // it as an implicit request to tunnel rather than failing if the
+      // user forgot to also check/pass -tunnel or -via.
+      if (isUnixSocket && !vncServerName.startsWith("/") &&
+          !tunnel.getValue() && via.getValue().isEmpty()) {
+        vlog.info("Automatically enabling SSH tunnel for Unix domain socket \""+
+                  vncServerName+"\"");
+        tunnel.setParam(true);
+      }
+
       try {
         if (tunnel.getValue() || !via.getValue().isEmpty()) {
           int localPort = TcpSocket.findFreeTcpPort();
@@ -119,8 +135,8 @@ public final class CConn extends CConnection implements
             gatewayHost = (isUnixSocket ? (vncServerName.startsWith("/") ? "localhost" : Hostname.getHost(vncServerName)) : getServerName());
 
           String remoteTarget = isUnixSocket ? Hostname.getSocketPath(vncServerName) : getServerName();
-          Tunnel.createTunnel(gatewayHost, remoteTarget,
-                              getServerPort(), localPort);
+          tunnelSession = Tunnel.createTunnel(gatewayHost, remoteTarget,
+                                              getServerPort(), localPort);
           sock = new TcpSocket("localhost", localPort);
           if (isUnixSocket)
             vlog.info("Connected to localhost port "+localPort+" (tunneled to Unix domain socket "+remoteTarget+")");
@@ -128,10 +144,20 @@ public final class CConn extends CConnection implements
             vlog.info("Connected to localhost port "+localPort);
         } else {
           if (isUnixSocket) {
-            throw new Exception("Connecting to a Unix domain socket directly is only supported via SSH tunnel (-via or -tunnel)");
+            // A bare path with no tunnel/via requested is a local (or
+            // already-forwarded, e.g. via a manually-run "ssh -L") Unix
+            // domain socket: connect to it directly, same as the C++
+            // viewer. A "host:/path" form has no local path to connect
+            // to without a tunnel, so that still requires -tunnel/-via.
+            if (!vncServerName.startsWith("/"))
+              throw new Exception("Connecting to a remote Unix domain socket directly is only supported via SSH tunnel (-via or -tunnel)");
+            String path = Hostname.getSocketPath(vncServerName);
+            sock = new UnixSocket(path);
+            vlog.info("Connected to Unix domain socket "+path);
+          } else {
+            sock = new TcpSocket(getServerName(), getServerPort());
+            vlog.info("Connected to host "+getServerName()+" port "+getServerPort());
           }
-          sock = new TcpSocket(getServerName(), getServerPort());
-          vlog.info("Connected to host "+getServerName()+" port "+getServerPort());
         }
       } catch (java.lang.Exception e) {
         throw new Exception(e.getMessage());
@@ -374,14 +400,32 @@ public final class CConn extends CConnection implements
       desktop.getToolkit().beep();
   }
 
-  public void serverCutText(String str, int len)
+  public void handleClipboardData(String data)
   {
-    StringSelection buffer;
-
     if (!acceptClipboard.getValue())
       return;
 
-    ClipboardDialog.serverCutText(str);
+    ClipboardDialog.serverCutText(data);
+  }
+
+  public void handleClipboardAnnounce(boolean available)
+  {
+    if (available && acceptClipboard.getValue())
+      requestClipboard();
+  }
+
+  public void handleClipboardRequest()
+  {
+    final String data = ClipboardDialog.getText();
+    clipboardSender.execute(() -> {
+      try {
+        if ((state() != stateEnum.RFBSTATE_NORMAL) || shuttingDown)
+          return;
+        sendClipboardData(data);
+      } catch (java.lang.Exception e) {
+        vlog.error("Failed to send clipboard data: " + e.getMessage());
+      }
+    });
   }
 
   public void dataRect(Rect r, int encoding)
@@ -402,6 +446,14 @@ public final class CConn extends CConnection implements
                         byte[] data)
   {
     desktop.setCursor(width, height, hotspot, data);
+  }
+
+  public void setLEDState(int state)
+  {
+    // can't call super.super.setLEDState(state);
+    server.setLEDState(state);
+
+    desktop.viewport.setLEDState(state);
   }
 
   public void fence(int flags, int len, byte[] data)
@@ -549,6 +601,11 @@ public final class CConn extends CConnection implements
 
   // close() shuts down the socket, thus waking up the RFB thread.
   public void close() {
+    synchronized (closeLock) {
+      if (closed)
+        return;
+      closed = true;
+    }
     if (updateTimeoutTimer != null) {
       updateTimeoutTimer.stop();
       updateTimeoutTimer = null;
@@ -560,20 +617,40 @@ public final class CConn extends CConnection implements
         f.dispatchEvent(new WindowEvent(f, WindowEvent.WINDOW_CLOSING));
     }
     shuttingDown = true;
+    clipboardSender.shutdownNow();
     super.close();
     try {
-      if (sock != null)
+      if (sock != null) {
         sock.shutdown();
+        sock = null;
+      }
     } catch (java.lang.Exception e) {
       throw new Exception(e.getMessage());
     }
+    OptionsDialog.removeCallback(this);
+    if (desktop != null) {
+      OptionsDialog.removeCallback(desktop);
+      if (desktop.viewport != null)
+        OptionsDialog.removeCallback(desktop.viewport);
+      desktop.dispose();
+      desktop = null;
+    }
+    Tunnel.closeTunnel(tunnelSession);
+    tunnelSession = null;
   }
 
-  // writeClientCutText() is called from the clipboard dialog
+  // Go through announceClipboard() so the server gets a Notify first;
+  // Xvnc drops a Provide from a client that hasn't announced.
   public void writeClientCutText(String str, int len) {
-    if ((state() != stateEnum.RFBSTATE_NORMAL) || shuttingDown)
-      return;
-    writer().writeClientCutText(str, len);
+    clipboardSender.execute(() -> {
+      try {
+        if ((state() != stateEnum.RFBSTATE_NORMAL) || shuttingDown)
+          return;
+        announceClipboard(true);
+      } catch (java.lang.Exception e) {
+        vlog.error("Failed to announce clipboard data: " + e.getMessage());
+      }
+    });
   }
 
   public void actionPerformed(ActionEvent e) {}
@@ -606,6 +683,15 @@ public final class CConn extends CConnection implements
   private String serverHost;
   private int serverPort;
   private Socket sock;
+  private Session tunnelSession;
+  private final Object closeLock = new Object();
+  private boolean closed = false;
+  private final ExecutorService clipboardSender =
+    Executors.newSingleThreadExecutor(r -> {
+      Thread t = new Thread(r, "Clipboard Sender");
+      t.setDaemon(true);
+      return t;
+    });
 
   protected DesktopWindow desktop;
 
@@ -636,7 +722,8 @@ public final class CConn extends CConnection implements
       }
 
       do {
-        processMsg();
+        if (!processMsg())
+          break;
       } while (sock != null && sock.inStream() != null && sock.inStream().checkNoWait(1));
     } catch (com.tigervnc.rdr.TimedOut e) {
       // Non-fatal socket timeout while waiting for remaining bytes

@@ -17,6 +17,7 @@ Build-Depends:
  libavcodec-dev,
  libavutil-dev,
  libswscale-dev,
+ libpulse-dev,
  libgnutls28-dev,
  libgmp-dev,
  libpam0g-dev,
@@ -32,6 +33,7 @@ Build-Depends:
  libpipewire-0.3-dev,
  libwayland-dev,
  libxkbcommon-dev,
+ libpwquality-dev,
 # Xorg dependencies
 # debhelper-compat (= 12),
  po-debconf,

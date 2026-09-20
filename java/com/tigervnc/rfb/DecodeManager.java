@@ -1,5 +1,5 @@
 /* Copyright 2015 Pierre Ossman for Cendio AB
- * Copyright 2016-2019 Brian P. Hinz
+ * Copyright 2016-2026 Brian P. Hinz
  * 
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -87,6 +87,15 @@ public class DecodeManager {
       consumerCond.signalAll();
     } finally {
       queueMutex.unlock();
+    }
+
+    // Release any resources (e.g. native zlib Inflater state) the
+    // decoders are holding onto -- they are otherwise only reachable
+    // via garbage collection/finalization, which leaks native memory
+    // in proportion to how many connections have been made.
+    for (Decoder d : decoders) {
+      if (d != null)
+        d.close();
     }
   }
 
@@ -195,7 +204,7 @@ public class DecodeManager {
     throwThreadException();
   }
 
-  private void setThreadException(Exception e)
+  private void setThreadException(Throwable e)
   {
     queueMutex.lock();
 
@@ -203,8 +212,11 @@ public class DecodeManager {
       if (threadException != null)
         return;
 
+      String msg = e.getMessage();
+      if (msg == null)
+        msg = e.getClass().getName();
       threadException =
-        new Exception("Exception on worker thread: "+e.getMessage());
+        new Exception("Exception on worker thread: "+msg);
       producerCond.signalAll();
     } finally {
       queueMutex.unlock();
@@ -301,10 +313,8 @@ public class DecodeManager {
           entry.decoder.decodeRect(entry.rect, entry.bufferStream.data(),
                                    entry.bufferStream.length(),
                                    entry.server, entry.pb);
-        } catch (com.tigervnc.rdr.Exception e) {
+        } catch (Throwable e) {
           manager.setThreadException(e);
-        } catch(java.lang.Exception e) {
-          assert(false);
         }
 
         manager.queueMutex.lock();

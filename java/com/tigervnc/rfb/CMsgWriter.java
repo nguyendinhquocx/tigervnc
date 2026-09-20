@@ -1,6 +1,6 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
  * Copyright 2009-2011 Pierre Ossman for Cendio AB
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -149,12 +149,30 @@ public class CMsgWriter {
 
   public void writeKeyEvent(int keysym, boolean down)
   {
+    writeKeyEvent(keysym, 0, down);
+  }
+
+  public void writeKeyEvent(int keysym, int keycode, boolean down)
+  {
     synchronized (os) {
-      startMsg(MsgTypes.msgTypeKeyEvent);
-      os.writeU8(down?1:0);
-      os.pad(2);
-      os.writeU32(keysym);
-      endMsg();
+      if (!server.supportsQEMUKeyEvent || keycode == 0) {
+        // This event isn't meaningful without a valid keysym
+        if (keysym == 0)
+          return;
+
+        startMsg(MsgTypes.msgTypeKeyEvent);
+        os.writeU8(down?1:0);
+        os.pad(2);
+        os.writeU32(keysym);
+        endMsg();
+      } else {
+        startMsg(MsgTypes.msgTypeQEMUClientMessage);
+        os.writeU8(MsgTypes.qemuExtendedKeyEvent);
+        os.writeU16(down?1:0);
+        os.writeU32(keysym);
+        os.writeU32(keycode);
+        endMsg();
+      }
     }
   }
 
@@ -184,6 +202,115 @@ public class CMsgWriter {
       Charset latin1 = Charset.forName("ISO-8859-1");
       ByteBuffer bytes = latin1.encode(str);
       os.writeBytes(bytes.array(), 0, len);
+      endMsg();
+    }
+  }
+
+  // Extended clipboard messages (UltraVNC pseudoEncodingExtendedClipboard)
+  // reuse msgTypeClientCutText, distinguished from classic clipboard text
+  // by a negative length field.
+
+  public void writeClipboardCaps(int caps, int[] lengths)
+  {
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardCaps) == 0)
+      throw new Exception("Server does not support clipboard \"caps\" action");
+
+    int count = 0;
+    for (int i = 0; i < 16; i++)
+      if ((caps & (1 << i)) != 0)
+        count++;
+
+    synchronized (os) {
+      startMsg(MsgTypes.msgTypeClientCutText);
+      os.pad(3);
+      os.writeS32(-(4 + 4 * count));
+      os.writeU32(caps | ClipboardTypes.clipboardCaps);
+      int idx = 0;
+      for (int i = 0; i < 16; i++)
+        if ((caps & (1 << i)) != 0)
+          os.writeU32(lengths[idx++]);
+      endMsg();
+    }
+  }
+
+  public void writeClipboardRequest(int flags)
+  {
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardRequest) == 0)
+      throw new Exception("Server does not support clipboard \"request\" action");
+
+    synchronized (os) {
+      startMsg(MsgTypes.msgTypeClientCutText);
+      os.pad(3);
+      os.writeS32(-4);
+      os.writeU32(flags | ClipboardTypes.clipboardRequest);
+      endMsg();
+    }
+  }
+
+  public void writeClipboardPeek()
+  {
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardPeek) == 0)
+      throw new Exception("Server does not support clipboard \"peek\" action");
+
+    synchronized (os) {
+      startMsg(MsgTypes.msgTypeClientCutText);
+      os.pad(3);
+      os.writeS32(-4);
+      os.writeU32(ClipboardTypes.clipboardPeek);
+      endMsg();
+    }
+  }
+
+  public void writeClipboardNotify(int flags)
+  {
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardNotify) == 0)
+      throw new Exception("Server does not support clipboard \"notify\" action");
+
+    synchronized (os) {
+      startMsg(MsgTypes.msgTypeClientCutText);
+      os.pad(3);
+      os.writeS32(-4);
+      os.writeU32(flags | ClipboardTypes.clipboardNotify);
+      endMsg();
+    }
+  }
+
+  public void writeClipboardProvide(int flags, int[] lengths, byte[][] data)
+  {
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardProvide) == 0)
+      throw new Exception("Server does not support clipboard \"provide\" action");
+
+    java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+    java.util.zip.Deflater deflater = new java.util.zip.Deflater();
+    try {
+      java.util.zip.DeflaterOutputStream dos =
+        new java.util.zip.DeflaterOutputStream(baos, deflater);
+      int count = 0;
+      for (int i = 0; i < 16; i++) {
+        if ((flags & (1 << i)) == 0)
+          continue;
+        int len = lengths[count];
+        dos.write((len >>> 24) & 0xff);
+        dos.write((len >>> 16) & 0xff);
+        dos.write((len >>> 8) & 0xff);
+        dos.write(len & 0xff);
+        dos.write(data[count]);
+        count++;
+      }
+      dos.finish();
+    } catch (java.io.IOException e) {
+      throw new Exception(e.getMessage());
+    } finally {
+      deflater.end();
+    }
+    byte[] compressed = baos.toByteArray();
+
+    synchronized (os) {
+      startMsg(MsgTypes.msgTypeClientCutText);
+      os.pad(3);
+      os.writeS32(-(4 + compressed.length));
+      os.writeU32(flags | ClipboardTypes.clipboardProvide);
+      os.writeBytes(compressed, 0, compressed.length);
       endMsg();
     }
   }
